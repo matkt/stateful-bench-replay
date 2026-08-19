@@ -8,7 +8,7 @@ Unlike the original tool (gas-bump + funding prelude + setup/testing `.txt`
 files), this runner reads **EEST JSON fixtures** directly:
 
 - `blockchain_test_stateful_engine` format
-- Shared `pre_run/<startBlockHash>.json`
+- Shared `pre_run/<startBlockHash>.json` (or tarball `pre-runs/geth/`)
 - Per-fixture `setupEngineNewPayloads` + `engineNewPayloads`
 
 ## Prerequisites
@@ -53,6 +53,7 @@ chmod +x runEestBenchmark.sh scripts/overlay.sh
 | `--test`, `-t` | Exact test name, repeatable (overrides filter) |
 | `--limit`, `-n` | Run at most N tests after filtering |
 | `--dry-run` | Resolve tests and exit |
+| `--verbose`, `-v` | With `--dry-run`: show resolved paths and setup line counts |
 | `--config`, `-c` | YAML config file |
 
 ## Per-test flow
@@ -98,14 +99,39 @@ Official EEST payload bundle for jochemnet v1 Amsterdam stateful benchmarks:
 curl -L -o eest-payloads.tar.gz \
   'https://github.com/ethpandaops/benchmarkoor-tests/releases/download/eest-payloads-jochemnet-v1-amsterdam-stateful-d9ad55b3-20260807-000744/eest-payloads-jochemnet-v1-amsterdam-stateful-geth.tar.gz'
 mkdir -p /data/eest-fixtures
-tar -xzf eest-payloads.tar.gz -C /data/eest-fixtures
+tar -xzf eest-payloads.tar.gz -C /data/eest-fixtures --strip-components=1
 ```
 
-The archive name says `geth` but the payloads are standard EEST engine fixtures
-(`blockchain_test_stateful_engine` JSON + `pre_run/`). After extraction, point
-`--fixtures` at the directory that contains those subdirs (often the tarball
-root, or `…/blockchain_tests_stateful_engine` if nested — use `--dry-run` to
-confirm tests are discovered).
+After extraction the layout is:
+
+```
+/data/eest-fixtures/
+  eest-payloads/geth/blockchain_tests_stateful_engine/…/*.json
+  pre-runs/geth/pre_run_bundle/pre-run.request   # gas-bump capture (~10 GB)
+```
+
+Pass **`--fixtures /data/eest-fixtures`** (the tarball root). The runner auto-resolves:
+
+- fixture search dir → `eest-payloads/geth/…`
+- pre_run dir → `pre-runs/geth/` (supports `pre_run/`, `pre-runs/`, `pre_runs/`)
+
+Verify before running Besu:
+
+```bash
+./runEestBenchmark.sh \
+  -F /data/eest-fixtures \
+  -f '*sstore_bloated*0100M*' \
+  --dry-run -v
+```
+
+Expect `setup_lines=3` or higher for tests with `setupEngineNewPayloads`. Some tests
+(e.g. `ether_transfers_onchain_receivers`) legitimately have `setup_lines=1` (anchor
+FCU only) because `startBlockHash == snapshotBlockHash` and they carry no setup payloads.
+
+The tarball ships gas-bump as `pre-run.request` (JSON-RPC lines), not `pre_run/*.json`.
+Bake gas-bump into the overlay prelude once (see stateful-bench-replay `persist-prelude`)
+so Besu starts at block ~24,407,727; do not point `--fixtures` at `eest-payloads/` alone
+or the sibling `pre-runs/` dir will not be found.
 
 ### 3. Besu image + genesis + JWT
 
@@ -145,7 +171,7 @@ call with HTTP status and `VALID` / `SYNCING` / `ACCEPTED` / error.
      missing `database/` under `overlay_dir/test/merged`.
    - **Genesis mismatch** — `--genesis-file` must match the snapshot network (jochemnet).
    - **Missing `pre_run/`** — setup payloads may be incomplete; stderr warns
-     `no pre_run for …`.
+     `no pre_run for …`. Check `pre-runs/geth/` (hyphen) not only `pre_run/`.
 
 3. **Replay reports OK but no import** — anchor FCU only moved fork choice without a
    successful benchmark `engine_newPayload`. Check `fixture lines: setup=… test=…` in

@@ -32,7 +32,13 @@ import jwt
 import requests
 import yaml
 
-from eest_discovery import EestTestCase, discover_eest_tests
+from eest_discovery import (
+    EestTestCase,
+    discover_eest_tests,
+    format_layout_report,
+    format_test_report,
+    resolve_fixtures_layout,
+)
 
 OVERLAY_SCRIPT = Path(__file__).resolve().parent / "scripts" / "overlay.sh"
 DOCKER = ["sudo", "-n", "docker"]
@@ -787,6 +793,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--test", "-t", action="append", default=None, help="exact test name (repeatable)")
     p.add_argument("--limit", "-n", type=int, default=None, help="run at most N tests")
     p.add_argument("--dry-run", action="store_true", help="list selected tests, no Besu/docker")
+    p.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="with --dry-run: show resolved fixture/pre_run paths and setup line counts",
+    )
     return p.parse_args(argv)
 
 
@@ -862,18 +874,67 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: snapshot dir missing: {cfg.besu.data_snapshot_dir}", file=sys.stderr)
         return 2
 
-    tests = discover_eest_tests(
+    try:
+        layout = resolve_fixtures_layout(cfg.input.fixtures_dir)
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    tests, layout = discover_eest_tests(
         cfg.input.fixtures_dir,
         pattern=pattern,
         explicit=explicit,
         limit=args.limit,
+        layout=layout,
+        strict_setup=args.dry_run,
     )
     if not tests:
         print(f"error: no tests matched filter={pattern!r}", file=sys.stderr)
+        if args.verbose or args.dry_run:
+            print(format_layout_report(layout, tests), file=sys.stderr)
         return 2
+
+    if args.verbose or args.dry_run:
+        print(format_layout_report(layout, tests))
+        for t in tests:
+            print(format_test_report(t))
+        thin_setup = [
+            t
+            for t in tests
+            if len(t.setup_lines) <= 1
+            and (t.setup_payload_count > 0 or stateful_pre_run_missing_from_test(t))
+        ]
+        if thin_setup:
+            print(
+                "\nwarn: some tests have setup_lines=1 (anchor FCU only). "
+                "If startBlockHash != snapshotBlockHash, ensure pre_run JSON exists under "
+                f"{layout.pre_run_dir or 'pre-runs/geth/'}.",
+                file=sys.stderr,
+            )
+            for t in thin_setup[:5]:
+                print(
+                    f"  thin setup: {t.name} "
+                    f"(pre_run={'yes' if t.pre_run_matched else 'no'}, "
+                    f"setupEngineNewPayloads={t.setup_payload_count})",
+                    file=sys.stderr,
+                )
+        if layout.pre_run_count == 0 and layout.pre_run_request is not None:
+            print(
+                f"\nnote: found gas-bump capture {layout.pre_run_request.name} "
+                f"({layout.pre_run_request}). "
+                "Bake it into the overlay prelude (stateful-bench-replay persist-prelude) "
+                "or replay separately; this runner does not ingest pre-run.request.",
+                file=sys.stderr,
+            )
 
     signal.signal(signal.SIGINT, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
     return run_sweep(cfg, tests, dry_run=args.dry_run)
+
+
+def stateful_pre_run_missing_from_test(test: EestTestCase) -> bool:
+    start = test.start_block_hash or ""
+    snapshot = test.snapshot_block_hash or ""
+    return bool(start) and start != snapshot
 
 
 if __name__ == "__main__":
