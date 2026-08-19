@@ -120,18 +120,25 @@ Verify before running Besu:
 ```bash
 ./runEestBenchmark.sh \
   -F /data/eest-fixtures \
-  -f '*sstore_bloated*0100M*' \
-  --dry-run -v
+  -f '*ether_transfers_onchain_receivers*100M*' \
+  --dry-run -v --limit 1
 ```
 
-Expect `setup_lines=3` or higher for tests with `setupEngineNewPayloads`. Some tests
-(e.g. `ether_transfers_onchain_receivers`) legitimately have `setup_lines=1` (anchor
-FCU only) because `startBlockHash == snapshotBlockHash` and they carry no setup payloads.
+Expected output (abbreviated):
 
-The tarball ships gas-bump as `pre-run.request` (JSON-RPC lines), not `pre_run/*.json`.
-Bake gas-bump into the overlay prelude once (see stateful-bench-replay `persist-prelude`)
-so Besu starts at block ~24,407,727; do not point `--fixtures` at `eest-payloads/` alone
-or the sibling `pre-runs/` dir will not be found.
+```
+fixtures search dir:    .../eest-payloads/geth/blockchain_tests_stateful_engine
+pre_run bundle file:    .../pre-runs/geth/pre_run_bundle/pre-run.request
+pre_run bundle lines:   15472
+  …test_ether_transfers_onchain_receivers…
+    total setup RPCs=15473 (bundle=15472, fixture setup=1) test_lines=2
+```
+
+The tarball ships gas-bump as `pre-runs/geth/pre_run_bundle/pre-run.request` (~15k Engine
+API lines, snapshot block 24402727 → startBlockHash ~24410463). The runner streams this
+**before** each test's anchor FCU + setup payloads. Alternatively bake gas-bump into the
+overlay prelude once (stateful-bench-replay `persist-prelude`) and use `--skip-gas-bump`
+style workflow — but per-test overlay reset to the raw snapshot requires bundle replay.
 
 ### 3. Besu image + genesis + JWT
 

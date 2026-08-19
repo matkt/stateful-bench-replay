@@ -34,6 +34,7 @@ import yaml
 
 from eest_discovery import (
     EestTestCase,
+    FixturesLayout,
     discover_eest_tests,
     format_layout_report,
     format_test_report,
@@ -633,6 +634,96 @@ def replay_lines(
     return True, stats
 
 
+def replay_pre_run_bundle(
+    cfg: Config,
+    secret: bytes,
+    session: requests.Session,
+    bundle_path: Path,
+    label: str,
+    log: SweepLog,
+) -> tuple[bool, ReplayStats]:
+    """Stream-replay pre-run.request JSON-RPC lines (gas-bump to startBlockHash)."""
+    prefix = "replay [pre_run_bundle] "
+    stats = ReplayStats()
+    if not bundle_path.is_file():
+        log.event(f"{prefix}bundle file missing: {bundle_path}")
+        return False, stats
+
+    log.event(f"{prefix}{label} from {bundle_path}")
+    line_no = 0
+    with bundle_path.open("r", encoding="utf-8") as handle:
+        for raw in handle:
+            raw = raw.strip()
+            if not raw:
+                continue
+            line_no += 1
+            stats.lines += 1
+            try:
+                method = json.loads(raw).get("method", "?")
+            except json.JSONDecodeError:
+                stats.fail += 1
+                log.event(f"{prefix} line {line_no}: bad JSON")
+                log.record_fail(label, line_no, "bad_json", {})
+                if cfg.run.fail_fast:
+                    return False, stats
+                continue
+
+            stats.rpc_calls += 1
+            if line_no == 1 or line_no % 500 == 0:
+                log.event(f"{prefix} progress: line {line_no}")
+
+            http_status, body, err = post_engine_line(cfg, secret, session, raw)
+            engine_status = _engine_response_status(method, body)
+
+            if err is not None and body is None:
+                stats.fail += 1
+                if method.startswith("engine_newPayload"):
+                    stats.newpayload_fail += 1
+                log.record_fail(label, line_no, "http_error", {"method": method, "error": err})
+                if cfg.run.fail_fast:
+                    return False, stats
+                continue
+            if http_status != 200:
+                stats.fail += 1
+                if method.startswith("engine_newPayload"):
+                    stats.newpayload_fail += 1
+                log.record_fail(
+                    label,
+                    line_no,
+                    "http_status",
+                    {"method": method, "status": http_status, "body": json.dumps(body)},
+                )
+                if cfg.run.fail_fast:
+                    return False, stats
+                continue
+
+            ok, kind, detail = _classify(method, body or {})
+            if ok:
+                stats.ok += 1
+                if method.startswith("engine_newPayload"):
+                    stats.newpayload_ok += 1
+                log.record_ok(label)
+            else:
+                stats.fail += 1
+                if method.startswith("engine_newPayload"):
+                    stats.newpayload_fail += 1
+                log.event(
+                    f"{prefix} line {line_no}: {method} -> HTTP {http_status} "
+                    f"status={engine_status} FAILED"
+                )
+                log.record_fail(label, line_no, kind, {"method": method, **detail})
+                if cfg.run.fail_fast:
+                    return False, stats
+
+    log.event(
+        f"{prefix}{label} done: rpc={stats.rpc_calls} ok={stats.ok} fail={stats.fail} "
+        f"newPayload ok={stats.newpayload_ok} fail={stats.newpayload_fail}"
+    )
+    if stats.fail > 0:
+        return False, stats
+    return True, stats
+
+
 def _parse_last_imported(log_path: Path) -> dict | None:
     if not log_path.is_file():
         return None
@@ -655,6 +746,7 @@ def _parse_last_imported(log_path: Path) -> dict | None:
 def run_sweep(
     cfg: Config,
     tests: list[EestTestCase],
+    layout: FixturesLayout,
     dry_run: bool,
 ) -> int:
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -670,7 +762,12 @@ def run_sweep(
     if dry_run:
         log.event("dry-run: wrote selected_tests.txt and exiting")
         for t in tests:
-            print(f"  {t.name}  (setup={len(t.setup_lines)}, test={len(t.test_lines)})")
+            total = layout.pre_run_bundle_lines + len(t.setup_lines)
+            print(
+                f"  {t.name}  "
+                f"(setup={total} [bundle={layout.pre_run_bundle_lines}+fixture={len(t.setup_lines)}], "
+                f"test={len(t.test_lines)})"
+            )
         log.flush_summary({"dry_run": True, "selected": len(tests)})
         log.close()
         return 0
@@ -709,7 +806,8 @@ def run_sweep(
                 log.event(f"[{idx}/{len(tests)}] {test.name}")
                 log.event(
                     f"[{idx}/{len(tests)}] fixture lines: "
-                    f"setup={len(test.setup_lines)} test={len(test.test_lines)} "
+                    f"bundle={layout.pre_run_bundle_lines} "
+                    f"fixture_setup={len(test.setup_lines)} test={len(test.test_lines)} "
                     f"source={test.source_file}"
                 )
                 per_test_reset(cfg.besu, log)
@@ -719,9 +817,25 @@ def run_sweep(
                 wait_for_engine(cfg.besu, secret, log)
                 log_chain_head(cfg.besu, log, f"[{idx}/{len(tests)}] head BEFORE setup")
 
-                test_ok, _ = replay_lines(
-                    cfg, secret, session, test.setup_lines, test.name, log, phase="setup"
-                )
+                test_ok = True
+                if layout.pre_run_bundle_path is not None:
+                    test_ok, _ = replay_pre_run_bundle(
+                        cfg,
+                        secret,
+                        session,
+                        layout.pre_run_bundle_path,
+                        test.name,
+                        log,
+                    )
+                    if test_ok:
+                        log_chain_head(
+                            cfg.besu, log, f"[{idx}/{len(tests)}] head AFTER pre_run_bundle"
+                        )
+
+                if test_ok:
+                    test_ok, _ = replay_lines(
+                        cfg, secret, session, test.setup_lines, test.name, log, phase="setup"
+                    )
                 if test_ok:
                     log_chain_head(cfg.besu, log, f"[{idx}/{len(tests)}] head AFTER setup")
                     test_ok, _ = replay_lines(
@@ -897,38 +1011,35 @@ def main(argv: list[str] | None = None) -> int:
     if args.verbose or args.dry_run:
         print(format_layout_report(layout, tests))
         for t in tests:
-            print(format_test_report(t))
+            print(format_test_report(t, layout))
         thin_setup = [
             t
             for t in tests
-            if len(t.setup_lines) <= 1
+            if layout.pre_run_bundle_lines + len(t.setup_lines) <= 1
             and (t.setup_payload_count > 0 or stateful_pre_run_missing_from_test(t))
         ]
         if thin_setup:
             print(
-                "\nwarn: some tests have setup_lines=1 (anchor FCU only). "
-                "If startBlockHash != snapshotBlockHash, ensure pre_run JSON exists under "
-                f"{layout.pre_run_dir or 'pre-runs/geth/'}.",
+                "\nwarn: some tests have almost no setup RPCs. "
+                "Ensure pre_run bundle is found under pre-runs/geth/pre_run_bundle/.",
                 file=sys.stderr,
             )
             for t in thin_setup[:5]:
                 print(
                     f"  thin setup: {t.name} "
-                    f"(pre_run={'yes' if t.pre_run_matched else 'no'}, "
-                    f"setupEngineNewPayloads={t.setup_payload_count})",
+                    f"(bundle={layout.pre_run_bundle_lines}, "
+                    f"fixture_setup={len(t.setup_lines)})",
                     file=sys.stderr,
                 )
-        if layout.pre_run_count == 0 and layout.pre_run_request is not None:
+        if layout.pre_run_bundle_path is None:
             print(
-                f"\nnote: found gas-bump capture {layout.pre_run_request.name} "
-                f"({layout.pre_run_request}). "
-                "Bake it into the overlay prelude (stateful-bench-replay persist-prelude) "
-                "or replay separately; this runner does not ingest pre-run.request.",
+                "\nwarn: no pre_run bundle (pre-run.request) found — "
+                "Besu must already be at startBlockHash (gas-bump baked in overlay).",
                 file=sys.stderr,
             )
 
     signal.signal(signal.SIGINT, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
-    return run_sweep(cfg, tests, dry_run=args.dry_run)
+    return run_sweep(cfg, tests, layout, dry_run=args.dry_run)
 
 
 def stateful_pre_run_missing_from_test(test: EestTestCase) -> bool:

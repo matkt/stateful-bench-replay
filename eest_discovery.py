@@ -32,7 +32,8 @@ class FixturesLayout:
     user_path: Path
     fixtures_search_dir: Path
     pre_run_dir: Path | None = None
-    pre_run_request: Path | None = None
+    pre_run_bundle_path: Path | None = None
+    pre_run_bundle_lines: int = 0
     pre_run_files: list[Path] = field(default_factory=list)
 
     @property
@@ -76,18 +77,35 @@ def _has_stateful_fixtures(path: Path) -> bool:
     return False
 
 
+def _prefer_blockchain_tests_dir(path: Path) -> Path:
+    nested = path / "blockchain_tests_stateful_engine"
+    if nested.is_dir() and _has_stateful_fixtures(nested):
+        return nested
+    return path
+
+
 def _find_fixtures_search_dir(root: Path) -> Path:
     root = root.resolve()
+
+    # Prefer the canonical tarball layout first.
+    for rel in (
+        "eest-payloads/geth/blockchain_tests_stateful_engine",
+        "eest-payloads/geth",
+        "blockchain_tests_stateful_engine",
+    ):
+        candidate = root / rel
+        if candidate.is_dir() and _has_stateful_fixtures(candidate):
+            return candidate if rel.endswith("blockchain_tests_stateful_engine") else _prefer_blockchain_tests_dir(candidate)
 
     for name in FIXTURES_DIR_NAMES:
         if root.name == name and name == "eest-payloads":
             for client in ("geth", "besu", "reth", "nethermind"):
                 nested = root / client
                 if _has_stateful_fixtures(nested):
-                    return nested
+                    return _prefer_blockchain_tests_dir(nested)
 
     if _has_stateful_fixtures(root):
-        return root
+        return _prefer_blockchain_tests_dir(root)
 
     for name in FIXTURES_DIR_NAMES:
         candidate = root / name
@@ -96,11 +114,11 @@ def _find_fixtures_search_dir(root: Path) -> Path:
                 for client in ("geth", "besu", "reth", "nethermind"):
                     nested = candidate / client
                     if _has_stateful_fixtures(nested):
-                        return nested
+                        return _prefer_blockchain_tests_dir(nested)
                 if _has_stateful_fixtures(candidate):
-                    return candidate
+                    return _prefer_blockchain_tests_dir(candidate)
             elif _has_stateful_fixtures(candidate):
-                return candidate
+                return _prefer_blockchain_tests_dir(candidate)
 
     for candidate in sorted(root.rglob("blockchain_tests_stateful_engine")):
         if candidate.is_dir() and _has_stateful_fixtures(candidate):
@@ -116,7 +134,7 @@ def _find_fixtures_search_dir(root: Path) -> Path:
         if isinstance(raw, dict) and any(
             isinstance(v, dict) and is_stateful_fixture(v) for v in raw.values()
         ):
-            return candidate.parent
+            return _prefer_blockchain_tests_dir(candidate.parent)
 
     return root
 
@@ -133,23 +151,38 @@ def _collect_pre_run_json_files(directory: Path) -> list[Path]:
     return out
 
 
-def _find_pre_run_request(directory: Path) -> Path | None:
+def _find_pre_run_bundle(directory: Path) -> Path | None:
     if not directory.is_dir():
         return None
-    for name in ("pre-run.request", "pre_run.request", "pre-run.txt", "gas-bump.txt"):
+    for name in ("pre-run.request", "pre_run.request", "pre-run.txt"):
         direct = directory / name
         if direct.is_file():
             return direct
+        bundle = directory / "pre_run_bundle" / name
+        if bundle.is_file():
+            return bundle
         for path in sorted(directory.rglob(name)):
             if path.is_file():
                 return path
     return None
 
 
-def _find_pre_run_dir(root: Path, fixtures_search_dir: Path) -> tuple[Path | None, list[Path], Path | None]:
+def count_pre_run_bundle_lines(path: Path) -> int:
+    count = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                count += 1
+    return count
+
+
+def _find_pre_run_dir(
+    root: Path, fixtures_search_dir: Path
+) -> tuple[Path | None, list[Path], Path | None, int]:
     search_roots = [root, fixtures_search_dir, fixtures_search_dir.parent, root.parent]
     seen: set[Path] = set()
-    pre_run_request: Path | None = None
+    pre_run_bundle: Path | None = None
+    bundle_lines = 0
 
     for base in search_roots:
         base = base.resolve()
@@ -161,34 +194,44 @@ def _find_pre_run_dir(root: Path, fixtures_search_dir: Path) -> tuple[Path | Non
             candidate = base / name
             if not candidate.is_dir():
                 continue
-            files = _collect_pre_run_json_files(candidate)
-            if files:
-                req = _find_pre_run_request(candidate)
-                if req is not None:
-                    pre_run_request = pre_run_request or req
-                return candidate, files, pre_run_request
+
+            for search in (
+                candidate,
+                candidate / "geth",
+                candidate / "geth" / "pre_run_bundle",
+                candidate / "pre_run_bundle",
+            ):
+                if not search.is_dir():
+                    continue
+                bundle = _find_pre_run_bundle(search)
+                if bundle is not None:
+                    pre_run_bundle = pre_run_bundle or bundle
+                files = _collect_pre_run_json_files(search)
+                if files:
+                    if bundle is not None and bundle_lines == 0:
+                        bundle_lines = count_pre_run_bundle_lines(bundle)
+                    return search, files, pre_run_bundle, bundle_lines
+                if bundle is not None:
+                    if bundle_lines == 0:
+                        bundle_lines = count_pre_run_bundle_lines(bundle)
+                    return search, [], pre_run_bundle, bundle_lines
 
             for client in ("geth", "besu", "reth", "nethermind"):
                 nested = candidate / client
                 if not nested.is_dir():
                     continue
+                bundle = _find_pre_run_bundle(nested)
+                if bundle is not None:
+                    pre_run_bundle = pre_run_bundle or bundle
                 files = _collect_pre_run_json_files(nested)
-                req = _find_pre_run_request(nested)
-                if req is not None:
-                    pre_run_request = pre_run_request or req
-                if files or req is not None:
-                    return nested, files, pre_run_request or req
+                if files or bundle is not None:
+                    if bundle is not None and bundle_lines == 0:
+                        bundle_lines = count_pre_run_bundle_lines(bundle)
+                    return nested, files, pre_run_bundle, bundle_lines
 
-            bundle = candidate / "geth" / "pre_run_bundle"
-            if bundle.is_dir():
-                files = _collect_pre_run_json_files(bundle)
-                req = _find_pre_run_request(bundle)
-                if req is not None:
-                    pre_run_request = pre_run_request or req
-                if files or req is not None:
-                    return bundle, files, pre_run_request or req
-
-    return None, [], pre_run_request
+    if pre_run_bundle is not None and bundle_lines == 0:
+        bundle_lines = count_pre_run_bundle_lines(pre_run_bundle)
+    return None, [], pre_run_bundle, bundle_lines
 
 
 def resolve_fixtures_layout(user_path: Path) -> FixturesLayout:
@@ -198,13 +241,16 @@ def resolve_fixtures_layout(user_path: Path) -> FixturesLayout:
         raise FileNotFoundError(f"fixtures dir missing: {user_path}")
 
     fixtures_search_dir = _find_fixtures_search_dir(user_path)
-    pre_run_dir, pre_run_files, pre_run_request = _find_pre_run_dir(user_path, fixtures_search_dir)
+    pre_run_dir, pre_run_files, pre_run_bundle_path, bundle_lines = _find_pre_run_dir(
+        user_path, fixtures_search_dir
+    )
 
     return FixturesLayout(
         user_path=user_path,
         fixtures_search_dir=fixtures_search_dir,
         pre_run_dir=pre_run_dir,
-        pre_run_request=pre_run_request,
+        pre_run_bundle_path=pre_run_bundle_path,
+        pre_run_bundle_lines=bundle_lines,
         pre_run_files=pre_run_files,
     )
 
@@ -245,11 +291,11 @@ def _should_skip_fixture_path(rel: Path) -> bool:
 def _expected_setup_lines(
     setup_payload_count: int,
     pre_run_payload_count: int,
+    bundle_lines: int = 0,
 ) -> int:
     payloads = pre_run_payload_count + setup_payload_count
-    if payloads == 0:
-        return 1  # anchor FCU only
-    return 1 + payloads * 2
+    fixture_setup = 1 if payloads == 0 else 1 + payloads * 2
+    return bundle_lines + fixture_setup
 
 
 def discover_eest_tests(
@@ -322,8 +368,13 @@ def discover_eest_tests(
                 print(f"warn: skipping {test_name}: no benchmark lines", file=sys.stderr)
                 continue
 
-            expected = _expected_setup_lines(setup_payload_count, pre_run_payload_count)
-            if strict_setup and len(converted.setup_lines) < expected:
+            expected = _expected_setup_lines(
+                setup_payload_count,
+                pre_run_payload_count,
+                layout.pre_run_bundle_lines,
+            )
+            fixture_setup = len(converted.setup_lines)
+            if strict_setup and layout.pre_run_bundle_lines + fixture_setup < expected:
                 print(
                     f"error: {test_name}: setup has {len(converted.setup_lines)} RPC lines "
                     f"but expected >= {expected} "
@@ -361,19 +412,26 @@ def format_layout_report(layout: FixturesLayout, tests: list[EestTestCase]) -> s
         f"pre_run dir:            {layout.pre_run_dir or '(not found)'}",
         f"pre_run json files:     {layout.pre_run_count}",
     ]
-    if layout.pre_run_request is not None:
-        lines.append(f"pre_run request file:   {layout.pre_run_request}")
+    if layout.pre_run_bundle_path is not None:
+        lines.append(f"pre_run bundle file:    {layout.pre_run_bundle_path}")
+        lines.append(f"pre_run bundle lines:   {layout.pre_run_bundle_lines}")
     lines.append(f"matched tests:          {len(tests)}")
     return "\n".join(lines)
 
 
-def format_test_report(test: EestTestCase) -> str:
-    expected = _expected_setup_lines(test.setup_payload_count, test.pre_run_payload_count)
+def format_test_report(test: EestTestCase, layout: FixturesLayout) -> str:
+    expected = _expected_setup_lines(
+        test.setup_payload_count,
+        test.pre_run_payload_count,
+        layout.pre_run_bundle_lines,
+    )
     pre = "yes" if test.pre_run_matched else "no"
+    total_setup = layout.pre_run_bundle_lines + len(test.setup_lines)
     return (
         f"  {test.name}\n"
-        f"    setup_lines={len(test.setup_lines)} test_lines={len(test.test_lines)} "
-        f"(expected setup>={expected})\n"
+        f"    total setup RPCs={total_setup} "
+        f"(bundle={layout.pre_run_bundle_lines}, fixture setup={len(test.setup_lines)}) "
+        f"test_lines={len(test.test_lines)} (expected setup>={expected})\n"
         f"    pre_run={pre} pre_run_payloads={test.pre_run_payload_count} "
         f"setupEngineNewPayloads={test.setup_payload_count}\n"
         f"    startBlockHash={test.start_block_hash}\n"
