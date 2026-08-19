@@ -122,6 +122,57 @@ Example filter for the non-existent receiver regression:
   -f '*ether_transfers_onchain_receivers*nonexistent*100M*'
 ```
 
+## Troubleshooting: Besu starts but no `Imported #` lines
+
+**Always inspect `runs/<timestamp>/events.log` first** — docker/Besu logs alone do not show
+Engine API replay. The runner logs every `engine_newPayload*` / `engine_forkchoiceUpdated*`
+call with HTTP status and `VALID` / `SYNCING` / `ACCEPTED` / error.
+
+### Symptom: Besu logs stop at `Ethereum main loop is up`
+
+1. **Runner stuck on Engine API** — `events.log` shows repeated
+   `Engine API not ready yet`. Common causes:
+   - `--engine-rpc-enabled=true` missing from `besu.extra_args`
+   - Wrong `engine_url` port (default `8551`)
+   - **JWT mismatch**: Python uses `jwt_secret_path`; Besu uses `--engine-jwt-secret`.
+     They must be the same file (mount host path into the container). The runner auto-adds
+     a JWT bind-mount when missing; ensure `jwt_secret_path` exists or can be created.
+
+2. **Engine API up but replay fails** — look for lines like
+   `status=SYNCING` or `status=ACCEPTED` instead of `VALID`:
+   - **Wrong or empty snapshot** — chain head before setup should be ~`#24,402,727`
+     for jochemnet, not `#0`. Check `data_snapshot_dir`, overlay mount, and warnings about
+     missing `database/` under `overlay_dir/test/merged`.
+   - **Genesis mismatch** — `--genesis-file` must match the snapshot network (jochemnet).
+   - **Missing `pre_run/`** — setup payloads may be incomplete; stderr warns
+     `no pre_run for …`.
+
+3. **Replay reports OK but no import** — anchor FCU only moved fork choice without a
+   successful benchmark `engine_newPayload`. Check `fixture lines: setup=… test=…` in
+   `events.log`; `test=` should be > 0 (typically 2 lines per payload: newPayload + FCU).
+
+4. **No tests matched** — run `--dry-run` and confirm `selected_tests.txt` is non-empty.
+
+5. **macOS** — OverlayFS bind mounts are not supported; run on Linux (VM).
+
+### Quick checks on the VM
+
+```bash
+# Overlay has snapshot data
+ls -la /data/besu-overlay/test/merged/database
+
+# Chain head via HTTP RPC (after Besu start)
+curl -s -X POST http://127.0.0.1:8545 \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'
+
+# Engine API + JWT (replace JWT from jwt_secret_path)
+curl -s -X POST http://127.0.0.1:8551 \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $JWT" \
+  -d '{"jsonrpc":"2.0","method":"engine_exchangeCapabilities","params":[[]],"id":1}'
+```
+
 ## Sudoers (one-time)
 
 ```bash

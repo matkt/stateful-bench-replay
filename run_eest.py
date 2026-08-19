@@ -243,7 +243,8 @@ def _besu_log_filename(idx: int, name: str, failed: bool = False) -> str:
 
 def start_besu(cfg: BesuConfig, log: SweepLog) -> None:
     stop_container(cfg.container_name)
-    merged = cfg.overlay_dir / "test" / "merged"
+    _validate_overlay_datadir(cfg, log)
+    merged = _overlay_merged_path(cfg)
     docker_cmd: list[str] = list(DOCKER) + [
         "run", "-d",
         "--name", cfg.container_name,
@@ -321,7 +322,9 @@ def wait_for_engine(cfg: BesuConfig, secret: bytes, log: SweepLog) -> None:
     )
     log.event(f"waiting for Engine API at {cfg.engine_url} (timeout {cfg.startup_timeout_s}s)")
     last_err: str | None = None
+    attempt = 0
     while time.monotonic() < deadline:
+        attempt += 1
         if not _container_running(cfg.container_name):
             _dump_container_logs(cfg.container_name, log)
             raise RuntimeError(f"Besu container {cfg.container_name} exited during startup")
@@ -335,12 +338,24 @@ def wait_for_engine(cfg: BesuConfig, secret: bytes, log: SweepLog) -> None:
                 },
                 timeout=5,
             )
-            if r.status_code == 200 and "result" in r.json():
-                log.event("Engine API is up")
-                return
-            last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+            if r.status_code == 200:
+                body = r.json()
+                if "result" in body:
+                    log.event("Engine API is up")
+                    return
+                last_err = f"HTTP 200 but no result: {r.text[:200]}"
+            elif r.status_code in (401, 403):
+                last_err = (
+                    f"HTTP {r.status_code} (JWT rejected) — "
+                    f"check jwt_secret_path={cfg.jwt_secret_path} matches "
+                    f"--engine-jwt-secret in extra_args and extra_mounts"
+                )
+            else:
+                last_err = f"HTTP {r.status_code}: {r.text[:200]}"
         except (requests.RequestException, ValueError) as exc:
             last_err = repr(exc)
+        if attempt == 1 or attempt % 5 == 0:
+            log.event(f"Engine API not ready yet (attempt {attempt}): {last_err}")
         time.sleep(2)
     _dump_container_logs(cfg.container_name, log)
     raise RuntimeError(
@@ -382,10 +397,83 @@ def query_chain_head(cfg: BesuConfig) -> tuple[int, str] | None:
 def log_chain_head(cfg: BesuConfig, log: SweepLog, prefix: str) -> None:
     head = query_chain_head(cfg)
     if head is None:
-        log.event(f"{prefix}: chain head unavailable")
+        log.event(
+            f"{prefix}: chain head unavailable over {_rpc_http_url(cfg)} "
+            "(is --rpc-http-enabled=true and port correct?)"
+        )
     else:
         block_no, block_hash = head
-        log.event(f"{prefix}: head = #{block_no} {block_hash}")
+        log.event(f"{prefix}: head = #{block_no:,} ({block_hash})")
+
+
+def _engine_jwt_container_path(cfg: BesuConfig) -> str:
+    for arg in cfg.extra_args:
+        if arg.startswith("--engine-jwt-secret="):
+            return arg.split("=", 1)[1]
+    return "/tmp/jwtsecret"
+
+
+def _jwt_mount_host_paths(extra_mounts: list[str]) -> set[str]:
+    hosts: set[str] = set()
+    for spec in extra_mounts:
+        host = spec.split(":", 1)[0]
+        if host:
+            hosts.add(str(Path(host).resolve()))
+    return hosts
+
+
+def _ensure_jwt_mount(cfg: BesuConfig, log: SweepLog) -> None:
+    """Mount jwt_secret_path into the container if the user did not already."""
+    host = str(cfg.jwt_secret_path.resolve())
+    if host in _jwt_mount_host_paths(cfg.extra_mounts):
+        return
+    container = _engine_jwt_container_path(cfg)
+    spec = f"{host}:{container}:ro"
+    cfg.extra_mounts.append(spec)
+    log.event(f"auto jwt mount: {spec}")
+
+
+def _overlay_merged_path(cfg: BesuConfig) -> Path:
+    return cfg.overlay_dir / "test" / "merged"
+
+
+def _datadir_markers_present(path: Path) -> bool:
+    markers = ("database", "DATABASE_METADATA.json", "besu.ports", "caches")
+    return any((path / marker).exists() for marker in markers)
+
+
+def _validate_overlay_datadir(cfg: BesuConfig, log: SweepLog) -> None:
+    merged = _overlay_merged_path(cfg)
+    if not merged.is_dir():
+        raise RuntimeError(
+            f"overlay merged dir missing: {merged} "
+            "(overlay reset failed or overlay_dir wrong)"
+        )
+    if not _datadir_markers_present(merged):
+        log.event(
+            f"WARN: overlay merged {merged} has no Besu datadir markers "
+            f"({', '.join(('database', 'DATABASE_METADATA.json'))}); "
+            "snapshot path may be wrong or empty"
+        )
+
+
+def _engine_response_status(method: str, body: dict | None) -> str:
+    if body is None:
+        return "NO_BODY"
+    if "error" in body:
+        err = body["error"]
+        code = err.get("code", "?")
+        msg = err.get("message", err)
+        return f"RPC_ERROR({code}): {msg}"
+    result = body.get("result")
+    if not isinstance(result, dict):
+        return "NO_RESULT"
+    if method.startswith("engine_newPayload"):
+        return (result.get("status") or "UNKNOWN").upper()
+    if method.startswith("engine_forkchoiceUpdated"):
+        ps = result.get("payloadStatus") or {}
+        return (ps.get("status") or "UNKNOWN").upper()
+    return "OK"
 
 
 def _classify(method: str, body: dict) -> tuple[bool, str, dict]:
@@ -398,13 +486,13 @@ def _classify(method: str, body: dict) -> tuple[bool, str, dict]:
         status = (result.get("status") or "").upper()
         if status in _NEWPAYLOAD_OK:
             return True, "", {}
-        return False, "newpayload_not_valid", {"result": result}
+        return False, "newpayload_not_valid", {"result": result, "status": status}
     if method.startswith("engine_forkchoiceUpdated"):
         ps = result.get("payloadStatus") or {}
         status = (ps.get("status") or "").upper()
         if status in _FCU_OK:
             return True, "", {}
-        return False, "fcu_not_valid", {"result": result}
+        return False, "fcu_not_valid", {"result": result, "status": status}
     return True, "", {}
 
 
@@ -430,6 +518,16 @@ def post_engine_line(
     return resp.status_code, body, None
 
 
+@dataclasses.dataclass
+class ReplayStats:
+    lines: int = 0
+    rpc_calls: int = 0
+    ok: int = 0
+    fail: int = 0
+    newpayload_ok: int = 0
+    newpayload_fail: int = 0
+
+
 def replay_lines(
     cfg: Config,
     secret: bytes,
@@ -438,9 +536,16 @@ def replay_lines(
     label: str,
     log: SweepLog,
     phase: str | None = None,
-) -> bool:
+    require_newpayload: bool = False,
+) -> tuple[bool, ReplayStats]:
     prefix = f"replay [{phase}] " if phase else "replay "
-    log.event(f"{prefix}{label} ({len(lines)} lines)")
+    non_empty = [ln.strip() for ln in lines if ln.strip()]
+    stats = ReplayStats(lines=len(non_empty))
+    log.event(f"{prefix}{label} ({stats.lines} RPC lines)")
+
+    if stats.lines == 0:
+        log.event(f"{prefix}{label}: no RPC lines to replay")
+        return True, stats
 
     for line_no, raw in enumerate(lines, start=1):
         raw = raw.strip()
@@ -449,40 +554,77 @@ def replay_lines(
         try:
             method = json.loads(raw).get("method", "?")
         except json.JSONDecodeError:
+            stats.fail += 1
+            log.event(f"{prefix} line {line_no}: bad JSON")
             log.record_fail(label, line_no, "bad_json", {})
             if cfg.run.fail_fast:
-                return False
+                return False, stats
             continue
 
-        status, body, err = post_engine_line(cfg, secret, session, raw)
+        stats.rpc_calls += 1
+        http_status, body, err = post_engine_line(cfg, secret, session, raw)
+        engine_status = _engine_response_status(method, body)
+        log.event(
+            f"{prefix} line {line_no}: {method} -> HTTP {http_status} status={engine_status}"
+        )
+
         if err is not None and body is None:
+            stats.fail += 1
+            if method.startswith("engine_newPayload"):
+                stats.newpayload_fail += 1
             log.record_fail(label, line_no, "http_error", {"method": method, "error": err})
             if cfg.run.fail_fast:
-                return False
+                return False, stats
             continue
-        if status != 200:
+        if http_status != 200:
+            stats.fail += 1
+            if method.startswith("engine_newPayload"):
+                stats.newpayload_fail += 1
             log.record_fail(
                 label,
                 line_no,
                 "http_status",
                 {
                     "method": method,
-                    "status": status,
+                    "status": http_status,
                     "body": json.dumps(body) if body is not None else err,
                 },
             )
             if cfg.run.fail_fast:
-                return False
+                return False, stats
             continue
 
         ok, kind, detail = _classify(method, body or {})
         if ok:
+            stats.ok += 1
+            if method.startswith("engine_newPayload"):
+                stats.newpayload_ok += 1
             log.record_ok(label)
         else:
+            stats.fail += 1
+            if method.startswith("engine_newPayload"):
+                stats.newpayload_fail += 1
             log.record_fail(label, line_no, kind, {"method": method, **detail})
             if cfg.run.fail_fast:
-                return False
-    return True
+                return False, stats
+
+    log.event(
+        f"{prefix}{label} done: rpc={stats.rpc_calls} ok={stats.ok} fail={stats.fail} "
+        f"newPayload ok={stats.newpayload_ok} fail={stats.newpayload_fail}"
+    )
+    if stats.fail > 0:
+        log.event(
+            f"{prefix}{label}: {stats.fail} Engine API call(s) failed "
+            f"(see failures.jsonl; SYNCING/ACCEPTED usually means wrong snapshot/genesis)"
+        )
+        return False, stats
+    if require_newpayload and stats.newpayload_ok == 0:
+        log.event(
+            f"{prefix}{label}: no successful engine_newPayload (VALID) — "
+            "Besu will not show Imported # lines"
+        )
+        return False, stats
+    return True, stats
 
 
 def _parse_last_imported(log_path: Path) -> dict | None:
@@ -531,6 +673,7 @@ def run_sweep(
         raise FileNotFoundError(f"snapshot dir missing: {cfg.besu.data_snapshot_dir}")
 
     ensure_jwt_secret(cfg.besu.jwt_secret_path, log)
+    _ensure_jwt_mount(cfg.besu, log)
     for spec in cfg.besu.extra_mounts:
         host = spec.split(":", 1)[0]
         if not host or not Path(host).exists():
@@ -558,6 +701,11 @@ def run_sweep(
         with requests.Session() as session:
             for idx, test in enumerate(tests, start=1):
                 log.event(f"[{idx}/{len(tests)}] {test.name}")
+                log.event(
+                    f"[{idx}/{len(tests)}] fixture lines: "
+                    f"setup={len(test.setup_lines)} test={len(test.test_lines)} "
+                    f"source={test.source_file}"
+                )
                 per_test_reset(cfg.besu, log)
 
                 start_besu(cfg.besu, log)
@@ -565,13 +713,20 @@ def run_sweep(
                 wait_for_engine(cfg.besu, secret, log)
                 log_chain_head(cfg.besu, log, f"[{idx}/{len(tests)}] head BEFORE setup")
 
-                test_ok = replay_lines(
+                test_ok, _ = replay_lines(
                     cfg, secret, session, test.setup_lines, test.name, log, phase="setup"
                 )
                 if test_ok:
                     log_chain_head(cfg.besu, log, f"[{idx}/{len(tests)}] head AFTER setup")
-                    test_ok = replay_lines(
-                        cfg, secret, session, test.test_lines, test.name, log, phase="testing"
+                    test_ok, _ = replay_lines(
+                        cfg,
+                        secret,
+                        session,
+                        test.test_lines,
+                        test.name,
+                        log,
+                        phase="testing",
+                        require_newpayload=True,
                     )
                     if test_ok:
                         log_chain_head(cfg.besu, log, f"[{idx}/{len(tests)}] head AFTER test")
@@ -585,6 +740,12 @@ def run_sweep(
                         f"{imported['mgas_per_s']:.2f} Mgas/s, exec {imported['exec_ms']:.1f}ms"
                     )
                     metrics.append({"test": test.name, **imported})
+                elif test_ok:
+                    log.event(
+                        f"[{idx}/{len(tests)}] WARN: Engine API replay succeeded but Besu "
+                        f"logs have no 'Imported #' line — check {log_path.name}"
+                    )
+                    test_ok = False
 
                 stop_container(cfg.besu.container_name)
                 started_container = False
@@ -632,15 +793,29 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def _default_config() -> Config:
     """Minimal config when only CLI paths are provided."""
     tool_dir = Path(__file__).resolve().parent
+    jwt_path = Path("/tmp/jwtsecret")
     return Config(
         besu=BesuConfig(
             image="hyperledger/besu:latest",
             container_name="besu-eest-bench",
             data_snapshot_dir=Path("/data/besu"),
             overlay_dir=Path("/data/besu-overlay"),
-            jwt_secret_path=Path("/tmp/jwtsecret"),
+            jwt_secret_path=jwt_path,
             engine_url="http://127.0.0.1:8551",
-            extra_args=[],
+            extra_args=[
+                "--sync-mode=FULL",
+                "--max-peers=0",
+                "--discovery-enabled=false",
+                "--rpc-http-enabled=true",
+                "--rpc-http-host=0.0.0.0",
+                "--rpc-http-port=8545",
+                "--rpc-http-api=ETH,NET",
+                "--host-allowlist=*",
+                "--engine-rpc-enabled=true",
+                f"--engine-jwt-secret={jwt_path}",
+                "--engine-rpc-port=8551",
+                "--engine-host-allowlist=*",
+            ],
             extra_mounts=[],
             startup_timeout_s=180,
             container_data_path="/opt/besu/data",
