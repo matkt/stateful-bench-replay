@@ -86,6 +86,7 @@ class RunConfig:
     request_timeout_s: int
     fail_fast: bool
     stop_container_on_exit: bool
+    skip_pre_run_bundle: bool
 
 
 @dataclasses.dataclass
@@ -127,9 +128,10 @@ def load_config(path: Path) -> Config:
         run=RunConfig(
             reset_overlay=bool(r.get("reset_overlay", True)),
             log_dir=_abs_path(r.get("log_dir", "./runs")),
-            request_timeout_s=int(r.get("request_timeout_s", 300)),
-            fail_fast=bool(r.get("fail_fast", False)),
+            request_timeout_s=int(r.get("request_timeout_s", 660)),
+            fail_fast=bool(r.get("fail_fast", True)),
             stop_container_on_exit=bool(r.get("stop_container_on_exit", True)),
+            skip_pre_run_bundle=bool(r.get("skip_pre_run_bundle", False)),
         ),
     )
 
@@ -634,6 +636,84 @@ def replay_lines(
     return True, stats
 
 
+def _parse_engine_line(raw: str) -> dict:
+    """Best-effort parse of an Engine API JSON-RPC line for logging."""
+    out: dict = {"method": "?"}
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        return out
+    out["method"] = obj.get("method", "?")
+    params = obj.get("params") or []
+    if out["method"].startswith("engine_newPayload") and params:
+        ep = params[0]
+        if isinstance(ep, str):
+            ep = json.loads(ep)
+        if isinstance(ep, dict):
+            out["block_number"] = int(ep["blockNumber"], 16)
+            out["block_hash"] = ep.get("blockHash")
+            out["parent_hash"] = ep.get("parentHash")
+            out["gas_used"] = int(ep.get("gasUsed", "0x0"), 16)
+    elif out["method"].startswith("engine_forkchoiceUpdated") and params:
+        state = params[0] or {}
+        out["head_hash"] = state.get("headBlockHash")
+    return out
+
+
+def _read_bundle_snapshot_anchor(bundle_path: Path) -> tuple[str, int, str] | None:
+    """Return (snapshot_block_hash, first_new_block_number, fcu_version) from line 1."""
+    with bundle_path.open("r", encoding="utf-8") as handle:
+        for raw in handle:
+            raw = raw.strip()
+            if not raw:
+                continue
+            info = _parse_engine_line(raw)
+            if info["method"].startswith("engine_newPayload") and info.get("parent_hash"):
+                version = int(info["method"].replace("engine_newPayloadV", ""))
+                fcu_version = 3 if version <= 3 else 3  # bundle uses FCU V3 throughout
+                return (
+                    str(info["parent_hash"]),
+                    int(info["block_number"]),
+                    f"engine_forkchoiceUpdatedV{fcu_version}",
+                )
+    return None
+
+
+def _anchor_chain_to_hash(
+    cfg: Config,
+    secret: bytes,
+    session: requests.Session,
+    block_hash: str,
+    fcu_method: str,
+    log: SweepLog,
+    label: str,
+) -> bool:
+    call = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "method": fcu_method,
+            "params": [
+                {
+                    "headBlockHash": block_hash,
+                    "safeBlockHash": "0x" + "0" * 64,
+                    "finalizedBlockHash": "0x" + "0" * 64,
+                },
+                None,
+            ],
+            "id": 0,
+        },
+        separators=(",", ":"),
+    )
+    log.event(f"{label}: anchor FCU to snapshot tip {block_hash}")
+    status, body, err = post_engine_line(cfg, secret, session, call)
+    engine_status = _engine_response_status(fcu_method, body)
+    log.event(f"{label}: snapshot anchor -> HTTP {status} status={engine_status}")
+    if err is not None or status != 200:
+        return False
+    ok, _, _ = _classify(fcu_method, body or {})
+    return ok
+
+
 def replay_pre_run_bundle(
     cfg: Config,
     secret: bytes,
@@ -650,6 +730,23 @@ def replay_pre_run_bundle(
         return False, stats
 
     log.event(f"{prefix}{label} from {bundle_path}")
+    anchor = _read_bundle_snapshot_anchor(bundle_path)
+    if anchor is not None:
+        snapshot_hash, first_block, fcu_method = anchor
+        log.event(
+            f"{prefix} snapshot tip hash={snapshot_hash} first bundle block=#{first_block:,}"
+        )
+        log_chain_head(cfg.besu, log, f"{prefix}head BEFORE snapshot anchor")
+        if not _anchor_chain_to_hash(
+            cfg, secret, session, snapshot_hash, fcu_method, log, prefix.rstrip()
+        ):
+            log.event(
+                f"{prefix} FAILED: Besu does not recognize snapshot tip {snapshot_hash}. "
+                "Check genesis-file matches jochemnet snapshot 24402727."
+            )
+            return False, stats
+        log_chain_head(cfg.besu, log, f"{prefix}head AFTER snapshot anchor")
+
     line_no = 0
     with bundle_path.open("r", encoding="utf-8") as handle:
         for raw in handle:
@@ -658,44 +755,38 @@ def replay_pre_run_bundle(
                 continue
             line_no += 1
             stats.lines += 1
-            try:
-                method = json.loads(raw).get("method", "?")
-            except json.JSONDecodeError:
-                stats.fail += 1
-                log.event(f"{prefix} line {line_no}: bad JSON")
-                log.record_fail(label, line_no, "bad_json", {})
-                if cfg.run.fail_fast:
-                    return False, stats
-                continue
+            info = _parse_engine_line(raw)
+            method = info.get("method", "?")
 
             stats.rpc_calls += 1
             if line_no == 1 or line_no % 500 == 0:
                 log.event(f"{prefix} progress: line {line_no}")
+                log_chain_head(cfg.besu, log, f"{prefix}head at line {line_no}")
 
             http_status, body, err = post_engine_line(cfg, secret, session, raw)
             engine_status = _engine_response_status(method, body)
 
             if err is not None and body is None:
                 stats.fail += 1
-                if method.startswith("engine_newPayload"):
-                    stats.newpayload_fail += 1
+                log.event(
+                    f"{prefix} ABORT line {line_no}: {method} transport error: {err} "
+                    f"{_format_line_context(info)}"
+                )
                 log.record_fail(label, line_no, "http_error", {"method": method, "error": err})
-                if cfg.run.fail_fast:
-                    return False, stats
-                continue
+                return False, stats
             if http_status != 200:
                 stats.fail += 1
-                if method.startswith("engine_newPayload"):
-                    stats.newpayload_fail += 1
+                log.event(
+                    f"{prefix} ABORT line {line_no}: {method} HTTP {http_status} "
+                    f"{_format_line_context(info)}"
+                )
                 log.record_fail(
                     label,
                     line_no,
                     "http_status",
                     {"method": method, "status": http_status, "body": json.dumps(body)},
                 )
-                if cfg.run.fail_fast:
-                    return False, stats
-                continue
+                return False, stats
 
             ok, kind, detail = _classify(method, body or {})
             if ok:
@@ -707,21 +798,36 @@ def replay_pre_run_bundle(
                 stats.fail += 1
                 if method.startswith("engine_newPayload"):
                     stats.newpayload_fail += 1
+                ctx = _format_line_context(info)
                 log.event(
-                    f"{prefix} line {line_no}: {method} -> HTTP {http_status} "
-                    f"status={engine_status} FAILED"
+                    f"{prefix} ABORT line {line_no}: {method} -> status={engine_status} "
+                    f"{ctx} — parent block missing or prior import failed; "
+                    "see chain head above; consider --skip-pre-run-bundle if gas-bump "
+                    "is already baked in overlay prelude"
                 )
                 log.record_fail(label, line_no, kind, {"method": method, **detail})
-                if cfg.run.fail_fast:
-                    return False, stats
+                return False, stats
 
     log.event(
         f"{prefix}{label} done: rpc={stats.rpc_calls} ok={stats.ok} fail={stats.fail} "
         f"newPayload ok={stats.newpayload_ok} fail={stats.newpayload_fail}"
     )
-    if stats.fail > 0:
-        return False, stats
     return True, stats
+
+
+def _format_line_context(info: dict) -> str:
+    parts: list[str] = []
+    if "block_number" in info:
+        parts.append(f"block=#{info['block_number']:,}")
+    if info.get("gas_used") is not None:
+        parts.append(f"gasUsed={info['gas_used']:,}")
+    if info.get("block_hash"):
+        parts.append(f"hash={info['block_hash']}")
+    if info.get("head_hash"):
+        parts.append(f"head={info['head_hash']}")
+    if info.get("parent_hash"):
+        parts.append(f"parent={info['parent_hash']}")
+    return "(" + ", ".join(parts) + ")" if parts else ""
 
 
 def _parse_last_imported(log_path: Path) -> dict | None:
@@ -818,7 +924,10 @@ def run_sweep(
                 log_chain_head(cfg.besu, log, f"[{idx}/{len(tests)}] head BEFORE setup")
 
                 test_ok = True
-                if layout.pre_run_bundle_path is not None:
+                if (
+                    layout.pre_run_bundle_path is not None
+                    and not cfg.run.skip_pre_run_bundle
+                ):
                     test_ok, _ = replay_pre_run_bundle(
                         cfg,
                         secret,
@@ -831,6 +940,12 @@ def run_sweep(
                         log_chain_head(
                             cfg.besu, log, f"[{idx}/{len(tests)}] head AFTER pre_run_bundle"
                         )
+                elif layout.pre_run_bundle_path is not None and cfg.run.skip_pre_run_bundle:
+                    log.event(
+                        f"[{idx}/{len(tests)}] skipping pre_run_bundle "
+                        "(run.skip_pre_run_bundle=true); chain must already be at startBlockHash"
+                    )
+                    log_chain_head(cfg.besu, log, f"[{idx}/{len(tests)}] head BEFORE setup")
 
                 if test_ok:
                     test_ok, _ = replay_lines(
@@ -913,6 +1028,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="with --dry-run: show resolved fixture/pre_run paths and setup line counts",
     )
+    p.add_argument(
+        "--skip-pre-run-bundle",
+        action="store_true",
+        help="skip pre-run.request gas-bump replay (chain already at startBlockHash)",
+    )
     return p.parse_args(argv)
 
 
@@ -952,9 +1072,10 @@ def _default_config() -> Config:
         run=RunConfig(
             reset_overlay=True,
             log_dir=tool_dir / "runs",
-            request_timeout_s=300,
-            fail_fast=False,
+            request_timeout_s=660,
+            fail_fast=True,
             stop_container_on_exit=True,
+            skip_pre_run_bundle=False,
         ),
     )
 
@@ -977,6 +1098,8 @@ def main(argv: list[str] | None = None) -> int:
         cfg.besu.data_snapshot_dir = _abs_path(args.snapshot)
     if args.fixtures:
         cfg.input.fixtures_dir = _abs_path(args.fixtures)
+    if args.skip_pre_run_bundle:
+        cfg.run.skip_pre_run_bundle = True
 
     pattern = args.filter or cfg.tests.filter
     explicit = args.test

@@ -188,6 +188,35 @@ call with HTTP status and `VALID` / `SYNCING` / `ACCEPTED` / error.
 
 5. **macOS** — OverlayFS bind mounts are not supported; run on Linux (VM).
 
+### Symptom: `pre_run_bundle` fails with `SYNCING` around line ~4098
+
+The bundle replays ~7736 gas-bump blocks (snapshot `#24,402,727` → startBlockHash
+`#24,410,463`). Line **4098** is roughly block **`#24,404,776`** (`24402727 + 4098/2`).
+
+At that point blocks carry **~982M gas** each (26 txs). A `SYNCING` on
+`engine_forkchoiceUpdatedV3` means the prior `engine_newPayloadV5` at line 4097 did not
+produce a canonical block Besu can fork-choice to.
+
+**Common causes and fixes:**
+
+| Cause | Fix |
+|-------|-----|
+| Partial gas-bump only (e.g. head `#24,407,728` from 5k-block prelude) | Bake the **full** `pre-run.request` (15472 lines) into overlay prelude once, then `skip_pre_run_bundle: true` |
+| `request_timeout_s` too low for 982M-gas blocks | Set `request_timeout_s: 660` (or higher) in config |
+| Genesis mismatch with snapshot | Use `genesis-jochemnet-24402727-amsterdam-besu.json` matching the snapshot |
+| ethpandaops image wrapper chown hang | `entrypoint: /opt/besu/bin/besu` |
+| Overlay upper disk full mid-replay | `df -h` on overlay dir; need tens of GB free |
+| Replaying bundle every test from raw snapshot | Prefer one-time prelude bake + `--skip-pre-run-bundle` |
+
+**Recommended workflow** (matches stateful-bench-replay):
+
+1. Bake `pre-run.request` into overlay prelude **once** (full 15472 lines → head `#24,410,463`).
+2. Set `run.skip_pre_run_bundle: true` or pass `--skip-pre-run-bundle`.
+3. Per-test overlay reset keeps prelude layer; only fixture setup + benchmark replay.
+
+If you must replay the bundle live, enable `fail_fast: true` (default) and inspect
+`events.log` for the first `ABORT line N` with block number and chain head.
+
 ### Quick checks on the VM
 
 ```bash

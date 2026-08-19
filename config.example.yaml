@@ -15,8 +15,8 @@ besu:
   overlay_dir: /data/besu-overlay
   container_data_path: /opt/besu/data
 
-  # Skip ethpandaops wrapper chown on large snapshots.
-  # entrypoint: /opt/besu/bin/besu
+  # Skip ethpandaops wrapper chown on large snapshots (recommended for ethpandaops/besu images).
+  entrypoint: /opt/besu/bin/besu
 
   jwt_secret_path: /tmp/jwtsecret
   engine_url: http://127.0.0.1:8551
@@ -27,7 +27,7 @@ besu:
 
   extra_args:
     - --data-storage-format=BONSAI
-    - --p2p-enabled=true
+    - --p2p-enabled=false
     - --sync-mode=FULL
     - --max-peers=0
     - --discovery-enabled=false
@@ -67,6 +67,10 @@ tests:
 run:
   reset_overlay: true
   log_dir: ./runs
-  request_timeout_s: 300
-  fail_fast: false
+  # Heavy gas-bump blocks (~982M gas) can take minutes each; keep this high.
+  request_timeout_s: 660
+  fail_fast: true
   stop_container_on_exit: true
+  # Set true (or pass --skip-pre-run-bundle) when gas-bump is already baked into
+  # overlay prelude and Besu starts at startBlockHash ~24410463.
+  skip_pre_run_bundle: false
