@@ -1,0 +1,72 @@
+# EEST stateful benchmark replay for Besu.
+#
+# Copy to config.yaml and edit paths for your machine. CLI flags (--snapshot,
+# --fixtures, --filter) override the values below.
+
+besu:
+  # Docker image with engine_newPayloadV5 (Amsterdam) support.
+  image: hyperledger/besu:latest
+  container_name: besu-eest-bench
+
+  # Read-only Besu datadir (extracted snapshot). Never written to directly;
+  # OverlayFS stacks test writes on top.
+  data_snapshot_dir: /data/besu/jochemnet-24402727
+
+  overlay_dir: /data/besu-overlay
+  container_data_path: /opt/besu/data
+
+  # Skip ethpandaops wrapper chown on large snapshots.
+  # entrypoint: /opt/besu/bin/besu
+
+  jwt_secret_path: /tmp/jwtsecret
+  engine_url: http://127.0.0.1:8551
+
+  extra_mounts:
+    - /tmp/jwtsecret:/tmp/jwtsecret:ro
+    - /path/to/genesis.json:/tmp/genesis.json:ro
+
+  extra_args:
+    - --data-storage-format=BONSAI
+    - --p2p-enabled=true
+    - --sync-mode=FULL
+    - --max-peers=0
+    - --discovery-enabled=false
+    - --rpc-http-enabled=true
+    - --rpc-http-host=0.0.0.0
+    - --rpc-http-port=8545
+    - --rpc-http-api=ETH,NET,DEBUG,MINER,NET,PERM,ADMIN,TXPOOL,WEB3
+    - --rpc-http-cors-origins=*
+    - --Xhttp-timeout-seconds=660
+    - --host-allowlist=*
+    - --engine-rpc-enabled=true
+    - --engine-jwt-secret=/tmp/jwtsecret
+    - --engine-rpc-port=8551
+    - --engine-host-allowlist=*
+    - --metrics-enabled=true
+    - --metrics-host=0.0.0.0
+    - --metrics-port=8008
+    - --genesis-file=/tmp/genesis.json
+    - --Xbal-state-root-timeout=-1
+    - --Xbal-processing-timeout=-1
+    - --Xbal-optimization-enabled=false
+    - --Xbal-perfect-parallelization-enabled=false
+    - --Xbal-trust-state-root=false
+
+  startup_timeout_s: 180
+
+input:
+  # Directory containing blockchain_test_stateful_engine JSON fixtures
+  # (including pre_run/ if present). One-time download:
+  # https://github.com/ethpandaops/benchmarkoor-tests/releases/download/eest-payloads-jochemnet-v1-amsterdam-stateful-d9ad55b3-20260807-000744/eest-payloads-jochemnet-v1-amsterdam-stateful-geth.tar.gz
+  fixtures_dir: /data/eest-fixtures
+
+tests:
+  filter: "*"
+  order: alphabetical
+
+run:
+  reset_overlay: true
+  log_dir: ./runs
+  request_timeout_s: 300
+  fail_fast: false
+  stop_container_on_exit: true
